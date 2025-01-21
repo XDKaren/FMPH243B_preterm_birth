@@ -1,0 +1,470 @@
+---
+title: "proj3_survival"
+date: "2024-03-07"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+* Goal is to check the analysis of the nejm paper
+* And provide additional exploratory analyses that might "break" the results
+- Are there other covariates that might lead to a different conclusion
+-- PC for dim red on immunology variables
+- Are the Kaplan-Meier curves actually different or not
+-- Cox pH before 32 weeks and after 34 weeks
+- How to deal with the multiple comparison issue
+-- Numerous additional analyses on the same dataset
+-- Look into different methods of p-value adjustment
+
+```{r echo = FALSE, message = FALSE, warning = FALSE}
+library(medicaldata)
+library(dplyr)
+data('opt')
+
+# colnames(opt)
+```
+
+Variables of Interests:
+Group
+Age: this is age at baseline
+Comorbidity indicator: diabetes + hypertension
+Drug indicator: drugs addiction + alcohol use
+Previos pregnancy
+Education
+
+Outcomes:
+GA.at.outcome (this is in days): this is gestational age at delivery; use this as event variable
+Preg.ended...37.wk: This is the pre-term birth indicator; use this as censoring indicator
+- Survival as primary, logistic as secondary
+
+Secondary Outcome:
+Birthweight --> need to binarize to less than 2500 g
+- Logistic Regression
+
+Check distributions:
+Birth.outcome
+
+# Subsetting the Dataframe
+```{r echo = FALSE}
+serum <- c("OAA1","OCR1","OFN1","OPG1","OPI1","OTD1","OTF1","OCRP1","O1B1","O61","O81","OPGE21","OTNF1","OMMP91","ETXU_CAT1","OFIBRIN1")
+opt_copy <- opt[,c('GA.at.outcome', 'Birthweight', 'Age', 'Preg.ended...37.wk', 'Education', 'Hypertension', 'Diabetes', 'Use.Tob', 'Use.Alc', 'Drug.Add', 'Prev.preg', 'Group', serum)]
+
+# Make all spaces and dot (.) NA
+opt_copy[opt_copy == ""|opt_copy==" "|opt_copy == "."] <- NA
+opt_copy[opt_copy == ''] <- NA
+
+
+## Change serum variable type to numeric
+opt_copy[,serum] <- sapply(opt_copy[,serum], as.numeric)
+
+# Get rid of any trailing spaces
+opt_copy <- opt_copy %>% 
+  mutate_if(is.factor, as.character) %>% 
+  mutate_if(is.character, trimws)
+
+# Re-format Hypertension Variable
+opt_copy <- mutate_at(opt_copy, vars(Hypertension), function(x) ifelse(x == "N", "No", ifelse(x == "Y", "Yes", x)))
+
+# Add Comorbidity
+# opt_copy$comorbidity <- apply(opt_copy[c('Hypertension', 'Diabetes', 'Prev.preg')], 1, function(x) {ifelse(any(x == "Yes"), "Yes", "No")})
+# 
+# # Add Drug Indicator
+# opt_copy$Drug.Use <- apply(opt_copy[c('Use.Tob', 'Use.Alc', 'Drug.Add')], 1, function(x) {ifelse(any(x == "Yes"), "Yes", "No")})
+
+# Check NAs for each variable
+# View(data.frame(apply(opt_copy, 2, function(x){sum(is.na(x))})))
+opt_copy[opt_copy == ''] <- NA
+
+# Before dropping NA serum columns, the number of preterm birth is 103
+table(opt_copy$Preg.ended...37.wk)
+
+# After dropping NA serum columns, the number of preterm birth is 98
+## Dropping missing values in serum varibales
+opt_copy_1 <- opt_copy[complete.cases(opt_copy[, serum]), ]
+table(opt_copy_1$Preg.ended...37.wk)
+
+
+complete_preterm <- opt_copy_1 %>% select(-Birthweight) 
+complete_preterm <- complete_preterm[complete.cases(complete_preterm),]
+complete_preterm <- droplevels(complete_preterm)
+
+complete_birthweight <- opt_copy_1 %>% select(-GA.at.outcome)
+complete_birthweight <- complete_birthweight[complete.cases(complete_birthweight),]
+complete_birthweight <- droplevels(complete_birthweight)
+```
+
+## PCA
+```{r}
+pca_complete_preterm <- prcomp(complete_preterm[,serum], scale = TRUE)
+summary(pca_complete_preterm)
+cumvars <- cumsum(pca_complete_preterm$sdev^2 / sum(pca_complete_preterm$sdev^2))
+
+plot(cumvars, xlab = 'Number of PCs', ylab = 'Proportion of Cumulative Variance', main = 'Scree Plot')
+grid()
+abline(h = 0.8, col = 'blue')
+
+rotated_dat <- as.data.frame(pca_complete_preterm$x)
+# 9 PCs instead of 16
+
+complete_preterm_extended <- cbind(complete_preterm[,-c(12:27)], rotated_dat[,1:9])
+complete_preterm_extended <- complete_preterm_extended[complete.cases(complete_preterm_extended),]
+
+## For low birth weight
+pca_complete_birthweight <- prcomp(complete_birthweight[,serum], scale = TRUE)
+summary(pca_complete_birthweight)
+cumvars2 <- cumsum(pca_complete_birthweight$sdev^2 / sum(pca_complete_birthweight$sdev^2))
+
+plot(cumvars2, xlab = 'Number of PCs', ylab = 'Proportion of Cumulative Variance', main = 'Scree Plot')
+grid()
+abline(h = 0.8, col = 'blue')
+# 9 PCs instead of 16
+rotated_dat <- as.data.frame(pca_complete_birthweight$x)
+
+biplot(pca_complete_birthweight,scale=0,cex=0.5)
+abline(h=0,v=0)
+
+complete_birthweight_extended <- cbind(complete_birthweight[,-c(12:27)], rotated_dat[,1:9])
+complete_birthweight_extended <- complete_birthweight_extended[complete.cases(complete_birthweight_extended),]
+
+```
+
+# Exploratory Plots for initial data
+```{r}
+library(survival)
+library(survminer)
+
+complete_preterm$Preg.ended...37.wk <- ifelse(complete_preterm$Preg.ended...37.wk == 'Yes', 1, 0)
+
+surv_obj <- with(complete_preterm, Surv(time = GA.at.outcome, event = Preg.ended...37.wk, type = 'right'))
+
+fit <- survfit(surv_obj ~ Group, data = complete_preterm)
+
+ggs <- ggsurvplot(fit,
+           pval = TRUE, conf.int = TRUE,
+           risk.table = TRUE, # Add risk table
+           risk.table.col = "strata", # Change risk table color by groups
+           linetype = "strata", # Change line type by groups
+           ggtheme = theme_bw(), # Change ggplot2 theme
+           palette = c("#F8766D", "#00BFC4"),
+           ylim=c(0.825,1),
+           xlim=c(90,310),
+           title = 'Survival Curves for Control and Treatment Cohort',
+           break.x.by = 20)
+
+#ggs$plot <- ggs$plot + ylim(c(0.75,1)) + xlim(c(90, 310))
+ggs
+
+surv_diff1 <- survdiff(Surv(time = GA.at.outcome, event = Preg.ended...37.wk, type = 'right') ~ Group, data = complete_preterm)
+surv_diff1
+```
+
+
+## Only checking the data pre-32.8 weeks aka 231 days or fewer 
+```{r}
+pre32 <- complete_preterm
+
+pre32$Preg.ended...37.wk <- NULL
+pre32$pre230 <- ifelse(pre32$GA.at.outcome <= 230, 1, 0)
+
+# new survival fit
+surv_obj2 <- with(pre32, Surv(time = GA.at.outcome, event = pre230, type = 'right')) 
+fit2 <- survfit(surv_obj2 ~ Group, data = pre32)
+
+ggs2 <- ggsurvplot(fit2,
+           pval = TRUE, conf.int = TRUE,
+           risk.table = TRUE, # Add risk table
+           risk.table.col = "strata", # Change risk table color by groups
+           linetype = "strata", # Change line type by groups
+           ggtheme = theme_bw(), # Change ggplot2 theme
+           palette = c("#F8766D", "#00BFC4"),
+           ylim=c(0.825,1),
+           xlim=c(90,240),
+           title = 'Survival Curves for Control and Treatment Cohort',
+           break.x.by = 20)
+
+#ggs$plot <- ggs$plot + ylim(c(0.75,1)) + xlim(c(90, 310))
+ggs2
+
+surv_diff2 <- survdiff(Surv(time = GA.at.outcome, event = pre230, type = 'right') ~ Group, data = pre32)
+surv_diff2
+```
+
+## Cox Proportional Hazards for preterm birth
+
+```{r}
+fit.coxph <- coxph(Surv(time = GA.at.outcome, event = Preg.ended...37.wk)~., data=complete_preterm)
+summary(fit.coxph)
+
+fit.coxph2 <- coxph(Surv(time = GA.at.outcome, event = pre230)~., data=pre32)
+# ggsurvplot(survfit(fit.coxph2), data = pre32)
+summary(fit.coxph2)
+```
+
+
+## Logistic regression for low birth weight
+
+```{r}
+# Define indicator for low birth weight (birth weight less than 2500mg)
+complete_birthweight$low.weight = ifelse(complete_birthweight$Birthweight <= 2500, 1, 0)
+
+fit.logis <- glm(low.weight~., data=complete_birthweight[,-1])
+summary(fit.logis)
+fit.logis.step <- step(fit.logis, direction = "backward")
+summary(fit.logis.step)
+```
+
+
+
+# Exploratory Plots for extended data
+```{r}
+library(survival)
+library(survminer)
+
+complete_preterm_extended$Preg.ended...37.wk <- ifelse(complete_preterm_extended$Preg.ended...37.wk == 'Yes', 1, 0)
+
+surv_obj <- with(complete_preterm_extended, Surv(time = GA.at.outcome, event = Preg.ended...37.wk, type = 'right'))
+
+fit.ext <- survfit(surv_obj ~ Group, data = complete_preterm_extended)
+
+ggs <- ggsurvplot(fit.ext,
+           pval = TRUE, conf.int = TRUE,
+           risk.table = TRUE, # Add risk table
+           risk.table.col = "strata", # Change risk table color by groups
+           linetype = "strata", # Change line type by groups
+           ggtheme = theme_bw(), # Change ggplot2 theme
+           palette = c("#F8766D", "#00BFC4"),
+           ylim=c(0.825,1),
+           xlim=c(90,310),
+           title = 'Survival Curves for Control and Treatment Cohort',
+           break.x.by = 20)
+
+#ggs$plot <- ggs$plot + ylim(c(0.75,1)) + xlim(c(90, 310))
+ggs
+
+surv_diff1_ext <- survdiff(Surv(time = GA.at.outcome, event = Preg.ended...37.wk, type = 'right') ~ Group, data = complete_preterm_extended)
+surv_diff1_ext
+```
+
+
+## Only checking the data pre-32.8 weeks aka 231 days or fewer 
+```{r}
+pre32_ext <- complete_preterm_extended
+
+pre32_ext$Preg.ended...37.wk <- NULL
+pre32_ext$pre230 <- ifelse(pre32_ext$GA.at.outcome <= 230, 1, 0)
+
+# new survival fit
+surv_obj2 <- with(pre32_ext, Surv(time = GA.at.outcome, event = pre230, type = 'right')) 
+fit2.ext <- survfit(surv_obj2 ~ Group, data = pre32_ext)
+
+ggs2 <- ggsurvplot(fit2.ext,
+           pval = TRUE, conf.int = TRUE,
+           risk.table = TRUE, # Add risk table
+           risk.table.col = "strata", # Change risk table color by groups
+           linetype = "strata", # Change line type by groups
+           ggtheme = theme_bw(), # Change ggplot2 theme
+           palette = c("#F8766D", "#00BFC4"),
+           ylim=c(0.825,1),
+           xlim=c(90,240),
+           title = 'Survival Curves for Control and Treatment Cohort',
+           break.x.by = 20)
+
+#ggs$plot <- ggs$plot + ylim(c(0.75,1)) + xlim(c(90, 310))
+ggs2
+
+surv_diff2_ext <- survdiff(Surv(time = GA.at.outcome, event = pre230, type = 'right') ~ Group, data = pre32_ext)
+surv_diff2_ext
+```
+
+## Cox Proportional Hazards for preterm birth
+
+```{r}
+# Full-length of the observation period
+fit.coxph.extend <- coxph(Surv(time = GA.at.outcome, event = Preg.ended...37.wk)~., data=complete_preterm_extended)
+summary(fit.coxph.extend)
+coef = round(cbind(summary(fit.coxph.extend)$coefficients[, c(2,5)], summary(fit.coxph.extend)$conf.int[, c(3,4)]),3)
+colnames(coef) = c("Hazard","P value", "2.5%", "97.5%")
+knitr::kable(coef)
+
+# 33 weeks of the observation period
+fit.coxph2.extend <- coxph(Surv(time = GA.at.outcome, event = pre230)~., data=pre32_ext)
+summary(fit.coxph2.extend)
+coef2 = round(cbind(summary(fit.coxph2.extend)$coefficients[, c(2,5)], summary(fit.coxph2.extend)$conf.int[, c(3,4)]),3)
+colnames(coef2) = c("Hazard","P value", "2.5%", "97.5%")
+knitr::kable(coef2)
+```
+
+
+## Logistic regression for low birth weight
+
+```{r}
+# Define indicator for low birth weight (birth weight less than 2500mg)
+complete_birthweight_extended$low.weight = ifelse(complete_birthweight_extended$Birthweight <= 2500, 1, 0)
+
+fit.logis.extend <- glm(low.weight~., data=complete_birthweight_extended[,-1])
+summary(fit.logis.extend)
+fit.logis.step.extend <- step(fit.logis.extend, direction = "backward")
+summary(fit.logis.step.extend)
+
+coef.log = round(cbind(exp(summary(fit.logis.step.extend)$coefficients[,1]),drop1(fit.logis.step.extend, test = "Chisq")$`Pr(>Chi)`, exp(confint(fit.logis.step.extend))),3)
+colnames(coef.log) = c("Odds ratio","P value", "2.5%", "97.5%")
+knitr::kable(coef.log)
+```
+
+
+
+# Sensitivity analysis
+
+```{r, message=FALSE}
+# Check missing value for the initial data
+# View(data.frame(apply(opt_copy, 2, function(x){sum(is.na(x))})))
+
+# Multiple imputation
+library(mice)
+
+opt_copy <- opt_copy %>% mutate_if(is.character, as.factor)
+
+my_imp = mice(opt_copy, m=5, maxit = 10, seed = 2024)
+opt_imp = complete(my_imp, 1)
+
+# Check missing value for imputed data
+# View(data.frame(apply(opt_imp, 2, function(x){sum(is.na(x))})))
+
+
+itt_preterm <- opt_imp %>% select(-Birthweight)
+itt_birthweight <- opt_imp %>% select(-GA.at.outcome)
+```
+
+
+## PCA
+```{r}
+pca_itt_preterm <- prcomp(itt_preterm[,serum], scale = TRUE)
+summary(pca_itt_preterm)
+cumvars <- cumsum(pca_itt_preterm$sdev^2 / sum(pca_itt_preterm$sdev^2))
+
+plot(cumvars, xlab = 'Number of PCs', ylab = 'Proportion of Cumulative Variance', main = 'Scree Plot')
+grid()
+abline(h = 0.8, col = 'blue')
+
+rotated_dat <- as.data.frame(pca_itt_preterm$x)
+# 9 PCs instead of 16
+
+itt_preterm_extended <- cbind(itt_preterm[,-c(12:27)], rotated_dat[,1:9])
+itt_preterm_extended <- itt_preterm_extended[complete.cases(itt_preterm_extended),]
+
+## For low birth weight
+pca_itt_birthweight <- prcomp(itt_birthweight[,serum], scale = TRUE)
+summary(pca_itt_birthweight)
+cumvars2 <- cumsum(pca_itt_birthweight$sdev^2 / sum(pca_itt_birthweight$sdev^2))
+
+plot(cumvars2, xlab = 'Number of PCs', ylab = 'Proportion of Cumulative Variance', main = 'Scree Plot')
+grid()
+abline(h = 0.8, col = 'blue')
+# 9 PCs instead of 16
+rotated_dat <- as.data.frame(pca_itt_birthweight$x)
+
+itt_birthweight_extended <- cbind(itt_birthweight[,-c(12:27)], rotated_dat[,1:9])
+itt_birthweight_extended <- itt_birthweight_extended[complete.cases(itt_birthweight_extended),]
+```
+
+## Logrank and plots
+
+```{r}
+itt_preterm_extended$Preg.ended...37.wk <- ifelse(itt_preterm_extended$Preg.ended...37.wk == 'Yes', 1, 0)
+
+surv_obj <- with(itt_preterm_extended, Surv(time = GA.at.outcome, event = Preg.ended...37.wk, type = 'right'))
+
+fit.ext <- survfit(surv_obj ~ Group, data = itt_preterm_extended)
+
+ggs <- ggsurvplot(fit.ext,
+           pval = TRUE, conf.int = TRUE,
+           risk.table = TRUE, # Add risk table
+           risk.table.col = "strata", # Change risk table color by groups
+           linetype = "strata", # Change line type by groups
+           ggtheme = theme_bw(), # Change ggplot2 theme
+           palette = c("#F8766D", "#00BFC4"),
+           ylim=c(0.825,1),
+           xlim=c(90,310),
+           title = 'Survival Curves for Control and Treatment Cohort',
+           break.x.by = 20)
+
+#ggs$plot <- ggs$plot + ylim(c(0.75,1)) + xlim(c(90, 310))
+ggs
+
+surv_diff1_ext <- survdiff(Surv(time = GA.at.outcome, event = Preg.ended...37.wk, type = 'right') ~ Group, data = itt_preterm_extended)
+surv_diff1_ext
+```
+
+
+## Only checking the data pre-32.8 weeks aka 231 days or fewer 
+```{r}
+pre32_ext <- itt_preterm_extended
+
+pre32_ext$Preg.ended...37.wk <- NULL
+pre32_ext$pre230 <- ifelse(pre32_ext$GA.at.outcome <= 230, 1, 0)
+
+# new survival fit
+surv_obj2 <- with(pre32_ext, Surv(time = GA.at.outcome, event = pre230, type = 'right')) 
+fit2.ext <- survfit(surv_obj2 ~ Group, data = pre32_ext)
+
+ggs2 <- ggsurvplot(fit2.ext,
+           pval = TRUE, conf.int = TRUE,
+           risk.table = TRUE, # Add risk table
+           risk.table.col = "strata", # Change risk table color by groups
+           linetype = "strata", # Change line type by groups
+           ggtheme = theme_bw(), # Change ggplot2 theme
+           palette = c("#F8766D", "#00BFC4"),
+           ylim=c(0.825,1),
+           xlim=c(90,240),
+           title = 'Survival Curves for Control and Treatment Cohort',
+           break.x.by = 20)
+
+#ggs$plot <- ggs$plot + ylim(c(0.75,1)) + xlim(c(90, 310))
+ggs2
+
+surv_diff2_ext <- survdiff(Surv(time = GA.at.outcome, event = pre230, type = 'right') ~ Group, data = pre32_ext)
+surv_diff2_ext
+```
+
+## Cox Proportional Hazards for preterm birth
+
+```{r}
+fit.coxph.extend <- coxph(Surv(time = GA.at.outcome, event = Preg.ended...37.wk)~., data=itt_preterm_extended)
+summary(fit.coxph.extend)
+coef = round(cbind(summary(fit.coxph.extend)$coefficients[, c(2,5)], summary(fit.coxph.extend)$conf.int[, c(3,4)]),3)
+colnames(coef) = c("Hazard","P value", "2.5%", "97.5%")
+knitr::kable(coef)
+
+fit.coxph2.extend <- coxph(Surv(time = GA.at.outcome, event = pre230)~., data=pre32_ext)
+summary(fit.coxph2.extend)
+coef2 = round(cbind(summary(fit.coxph2.extend)$coefficients[, c(2,5)], summary(fit.coxph2.extend)$conf.int[, c(3,4)]),3)
+colnames(coef2) = c("Hazard","P value", "2.5%", "97.5%")
+knitr::kable(coef2)
+```
+
+
+## Logistic regression for low birth weight
+
+```{r}
+# Define indicator for low birth weight (birth weight less than 2500mg)
+itt_birthweight_extended$low.weight = ifelse(itt_birthweight_extended$Birthweight <= 2500, 1, 0)
+
+# fit.logis.extend <- glm(low.weight~., data=itt_birthweight_extended[,-1])
+# summary(fit.logis.extend)
+# fit.logis.step.extend <- step(fit.logis.extend, direction = "backward")
+# summary(fit.logis.step.extend)
+
+
+fit.logis.itt <- glm(low.weight~Preg.ended...37.wk+Diabetes+PC3+PC7+PC8, data=itt_birthweight_extended[,-1])
+summary(fit.logis.itt)
+
+coef.log2 = round(cbind(exp(summary(fit.logis.itt)$coefficients[,1]),drop1(fit.logis.itt, test = "Chisq")$`Pr(>Chi)`, exp(confint(fit.logis.itt))),3)
+colnames(coef.log2) = c("Odds ratio","P value", "2.5%", "97.5%")
+knitr::kable(coef.log2)
+```
+
+
